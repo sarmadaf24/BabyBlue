@@ -1,0 +1,33 @@
+- hosts: localhost
+  connection: local
+  become: yes
+  vars:
+    enable_tls: false
+    firewall_allow_tcp: [22,80]
+    firewall_allow_udp: [51820,1194]   # RADIUS بعداً اضافه می‌شود
+    base_packages:
+      - nginx
+      - openvpn
+      - wireguard
+      - freeradius
+      - supervisor
+      - ufw
+      - iptables-persistent
+      - nftables
+      - python3
+      - python3-venv
+      - python3-pip
+      - build-essential
+      - git
+      - jq
+      - uwsgi
+      - uwsgi-plugin-python3
+      - influxdb
+      - qemu-guest-agent
+      - easy-rsa
+      - mailutils
+      - tree
+      - sshpass
+      - redis-server
+  roles:
+    - base
