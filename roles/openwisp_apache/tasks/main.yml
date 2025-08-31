@@ -5,11 +5,25 @@
     enabled: no
     masked: yes
 
-- name: Ensure Apache + mod_wsgi installed
+- name: Ensure Apache + mod_wsgi + WeasyPrint OS deps
   apt:
     name:
       - apache2
       - libapache2-mod-wsgi-py3
+      - libcairo2
+      - libpango-1.0-0
+      - libpangoft2-1.0-0
+      - libpangocairo-1.0-0
+      - libgdk-pixbuf2.0-0
+      - shared-mime-info
+      - fonts-dejavu-core
+      - libffi-dev
+      - python3-venv
+      - python3-pip
+      - build-essential
+      - python3-dev
+      - libssl-dev
+      - libpq-dev
     state: present
     update_cache: yes
 
@@ -18,6 +32,19 @@
     state: present
     name: "{{ item }}"
   loop: [ 'wsgi','headers','rewrite' ]
+
+- name: Set Apache global ServerName
+  copy:
+    dest: /etc/apache2/conf-available/servername.conf
+    content: "ServerName {{ (domains | default(['localhost']))[0] }}\n"
+    mode: '0644'
+
+- name: Enable servername.conf
+  file:
+    src: /etc/apache2/conf-available/servername.conf
+    dest: /etc/apache2/conf-enabled/servername.conf
+    state: link
+    force: true
 
 - name: Create project directories
   file:
@@ -49,6 +76,7 @@
       - openwisp-users
       - openwisp-radius
       - django-private-storage
+      - weasyprint
     executable: /opt/openwisp2/env/bin/pip
 
 - name: Generate Django secret (once)
