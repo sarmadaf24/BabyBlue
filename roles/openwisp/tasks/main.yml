@@ -7,6 +7,7 @@
       - python3-dev
       - libffi-dev
       - libssl-dev
+      - libpq-dev
     state: present
     update_cache: yes
 
@@ -25,11 +26,22 @@
   command: python3 -m venv /opt/openwisp2/env
   args: { creates: /opt/openwisp2/env/bin/activate }
 
-- name: Install Python deps
-  command: >
-    /opt/openwisp2/env/bin/pip install --upgrade pip
-    && /opt/openwisp2/env/bin/pip install "django==4.2.*" uwsgi django-allauth dj-rest-auth openwisp-users openwisp-radius
-  changed_when: true
+- name: Upgrade pip inside venv
+  pip:
+    name: pip
+    state: latest
+    executable: /opt/openwisp2/env/bin/pip
+
+- name: Install Python deps inside venv
+  pip:
+    name:
+      - "django==4.2.*"
+      - uwsgi
+      - django-allauth
+      - dj-rest-auth
+      - openwisp-users
+      - openwisp-radius
+    executable: /opt/openwisp2/env/bin/pip
 
 - name: Generate Django secret key (once)
   shell: "python3 - << 'PY'\nimport secrets, pathlib\np=pathlib.Path('/opt/openwisp2/.django-secret-key')\nprint('exists' if p.exists() else p.write_text(secrets.token_urlsafe(64)))\nPY"
