@@ -1,0 +1,13 @@
+server {
+    listen 80;
+    server_name {{ (domains | default(['_'])) | join(' ') }};
+    client_max_body_size 32m;
+
+    location /static/ { alias /opt/openwisp2/static/; }
+    location /media/  { alias /opt/openwisp2/media/; }
+
+    location / {
+        include uwsgi_params;
+        uwsgi_pass unix:/opt/openwisp2/uwsgi.sock;
+    }
+}

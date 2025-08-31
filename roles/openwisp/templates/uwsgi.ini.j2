@@ -1,0 +1,12 @@
+[uwsgi]
+chdir = /opt/openwisp2
+module = openwisp2.wsgi:application
+master = true
+processes = 2
+vacuum = true
+die-on-term = true
+socket = /opt/openwisp2/uwsgi.sock
+chmod-socket = 666
+harakiri = 30
+max-requests = 2000
+env = DJANGO_SETTINGS_MODULE=openwisp2.settings

@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenWISP uWSGI
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/uwsgi --ini /opt/openwisp2/uwsgi.ini
+Restart=always
+KillSignal=SIGQUIT
+Type=notify
+StandardError=syslog
+NotifyAccess=all
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,104 @@
+- name: Ensure packages for Django stack
+  apt:
+    name:
+      - python3-venv
+      - python3-pip
+      - build-essential
+      - python3-dev
+      - libffi-dev
+      - libssl-dev
+    state: present
+    update_cache: yes
+
+- name: Create project directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - /opt/openwisp2
+    - /opt/openwisp2/static
+    - /opt/openwisp2/media
+    - /opt/openwisp2/run
+
+- name: Create venv
+  command: python3 -m venv /opt/openwisp2/env
+  args: { creates: /opt/openwisp2/env/bin/activate }
+
+- name: Install Python deps
+  command: >
+    /opt/openwisp2/env/bin/pip install --upgrade pip
+    && /opt/openwisp2/env/bin/pip install "django==4.2.*" uwsgi django-allauth dj-rest-auth openwisp-users openwisp-radius
+  changed_when: true
+
+- name: Generate Django secret key (once)
+  shell: "python3 - << 'PY'\nimport secrets, pathlib\np=pathlib.Path('/opt/openwisp2/.django-secret-key')\nprint('exists' if p.exists() else p.write_text(secrets.token_urlsafe(64)))\nPY"
+  args: { creates: /opt/openwisp2/.django-secret-key }
+
+- name: Start Django project if missing
+  command: /opt/openwisp2/env/bin/python -m django startproject openwisp2 .
+  args:
+    chdir: /opt/openwisp2
+    creates: /opt/openwisp2/manage.py
+
+- name: Deploy settings.py (idempotent)
+  template:
+    src: settings.py.j2
+    dest: /opt/openwisp2/openwisp2/settings.py
+    mode: '0644'
+
+- name: Deploy uWSGI ini
+  template:
+    src: uwsgi.ini.j2
+    dest: /opt/openwisp2/uwsgi.ini
+    mode: '0644'
+
+- name: Migrate DB
+  command: /opt/openwisp2/env/bin/python manage.py migrate --noinput
+  args: { chdir: /opt/openwisp2 }
+  register: migrate_out
+  changed_when: "'No migrations to apply' not in migrate_out.stdout"
+
+- name: Collect static
+  command: /opt/openwisp2/env/bin/python manage.py collectstatic --noinput
+  args: { chdir: /opt/openwisp2 }
+  changed_when: true
+
+- name: Install Nginx site (HTTP only)
+  template:
+    src: openwisp_http.j2
+    dest: /etc/nginx/sites-available/openwisp
+    mode: '0644'
+
+- name: Enable Nginx site
+  file:
+    src: /etc/nginx/sites-available/openwisp
+    dest: /etc/nginx/sites-enabled/openwisp
+    state: link
+    force: true
+
+- name: Disable default site if exists
+  file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+
+- name: Deploy systemd unit for uWSGI
+  template:
+    src: openwisp-uwsgi.service.j2
+    dest: /etc/systemd/system/openwisp-uwsgi.service
+    mode: '0644'
+
+- name: Reload systemd
+  systemd:
+    daemon_reload: yes
+
+- name: Enable & restart uWSGI
+  systemd:
+    name: openwisp-uwsgi
+    state: restarted
+    enabled: yes
+
+- name: Reload Nginx
+  service:
+    name: nginx
+    state: reloaded

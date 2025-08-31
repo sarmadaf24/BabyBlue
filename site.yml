@@ -4,7 +4,7 @@
   vars:
     enable_tls: false
     firewall_allow_tcp: [22,80]
-    firewall_allow_udp: [51820,1194]   # RADIUS بعداً اضافه می‌شود
+    firewall_allow_udp: [51820,1194]
     base_packages:
       - nginx
       - openvpn
@@ -31,3 +31,4 @@
       - redis-server
   roles:
     - base
+    - openwisp
