@@ -9,6 +9,7 @@ INSTALLED_APPS = [
     'django.contrib.admin','django.contrib.auth','django.contrib.contenttypes',
     'django.contrib.sessions','django.contrib.messages','django.contrib.staticfiles',
     'django.contrib.sites',
+    'rest_framework','rest_framework.authtoken',
     'allauth','allauth.account','allauth.socialaccount',
     'openwisp_users','openwisp_radius',
     'dj_rest_auth','dj_rest_auth.registration',
@@ -50,6 +51,5 @@ SITE_ID=1
 AUTH_USER_MODEL='openwisp_users.User'
 DEFAULT_AUTO_FIELD='django.db.models.BigAutoField'
 
-# --- Required by openwisp-radius ---
+# openwisp-radius / private storage
 PRIVATE_STORAGE_ROOT = str(BASE_DIR / 'private')
-# PRIVATE_STORAGE_AUTH_FUNCTION default provided by openwisp-radius utils
