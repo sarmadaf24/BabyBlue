@@ -2,7 +2,6 @@
     ServerName {{ (domains | default(['_']))[0] }}
     ServerAdmin admin@localhost
 
-    # Django via mod_wsgi (venv)
     WSGIDaemonProcess openwisp python-home=/opt/openwisp2/env python-path=/opt/openwisp2
     WSGIProcessGroup openwisp
     WSGIScriptAlias / /opt/openwisp2/openwisp2/wsgi.py
