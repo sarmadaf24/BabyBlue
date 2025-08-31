@@ -7,6 +7,8 @@
     firewall_allow_udp: [51820,1194]
     base_packages:
       - nginx
+      - apache2
+      - libapache2-mod-wsgi-py3
       - openvpn
       - wireguard
       - freeradius
@@ -18,10 +20,12 @@
       - python3-venv
       - python3-pip
       - build-essential
+      - python3-dev
+      - libffi-dev
+      - libssl-dev
+      - libpq-dev
       - git
       - jq
-      - uwsgi
-      - uwsgi-plugin-python3
       - influxdb
       - qemu-guest-agent
       - easy-rsa
@@ -31,4 +35,4 @@
       - redis-server
   roles:
     - base
-    - openwisp
+    - openwisp_apache

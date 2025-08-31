@@ -1,0 +1,97 @@
+- name: Stop & disable Nginx (Apache will use :80)
+  service: { name: nginx, state: stopped, enabled: no }
+
+- name: Ensure Apache + mod_wsgi installed
+  apt:
+    name:
+      - apache2
+      - libapache2-mod-wsgi-py3
+    state: present
+    update_cache: yes
+
+- name: Enable required Apache modules
+  community.general.apache2_module:
+    state: present
+    name: "{{ item }}"
+  loop:
+    - wsgi
+    - headers
+    - rewrite
+
+- name: Create project directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - /opt/openwisp2
+    - /opt/openwisp2/static
+    - /opt/openwisp2/media
+
+- name: Create venv (if missing)
+  command: python3 -m venv /opt/openwisp2/env
+  args: { creates: /opt/openwisp2/env/bin/activate }
+
+- name: Upgrade pip in venv
+  pip:
+    name: pip
+    state: latest
+    executable: /opt/openwisp2/env/bin/pip
+
+- name: Install Python deps in venv
+  pip:
+    name:
+      - "django==4.2.*"
+      - django-allauth
+      - dj-rest-auth
+      - openwisp-users
+      - openwisp-radius
+    executable: /opt/openwisp2/env/bin/pip
+
+- name: Generate Django secret (once)
+  shell: "python3 - << 'PY'\nimport secrets, pathlib\np=pathlib.Path('/opt/openwisp2/.django-secret-key')\nprint('exists' if p.exists() else p.write_text(secrets.token_urlsafe(64)))\nPY"
+  args: { creates: /opt/openwisp2/.django-secret-key }
+
+- name: Start Django project if missing
+  command: /opt/openwisp2/env/bin/python -m django startproject openwisp2 .
+  args:
+    chdir: /opt/openwisp2
+    creates: /opt/openwisp2/manage.py
+
+- name: Deploy settings.py
+  template:
+    src: settings.py.j2
+    dest: /opt/openwisp2/openwisp2/settings.py
+    mode: '0644'
+
+- name: Migrate DB (SQLite)
+  command: /opt/openwisp2/env/bin/python manage.py migrate --noinput
+  args: { chdir: /opt/openwisp2 }
+  register: mig
+  changed_when: "'No migrations to apply' not in (mig.stdout | default(''))"
+
+- name: Collect static
+  command: /opt/openwisp2/env/bin/python manage.py collectstatic --noinput
+  args: { chdir: /opt/openwisp2 }
+  changed_when: true
+
+- name: Deploy Apache vhost (HTTP only)
+  template:
+    src: apache_openwisp.conf.j2
+    dest: /etc/apache2/sites-available/openwisp.conf
+    mode: '0644'
+
+- name: Disable default site
+  file:
+    path: /etc/apache2/sites-enabled/000-default.conf
+    state: absent
+
+- name: Enable openwisp site
+  file:
+    src: /etc/apache2/sites-available/openwisp.conf
+    dest: /etc/apache2/sites-enabled/openwisp.conf
+    state: link
+    force: true
+
+- name: Restart Apache
+  service: { name: apache2, state: restarted, enabled: yes }

@@ -1,0 +1,30 @@
+<VirtualHost *:80>
+    ServerName {{ (domains | default(['_']))[0] }}
+    ServerAdmin admin@localhost
+
+    # Django via mod_wsgi (venv)
+    WSGIDaemonProcess openwisp python-home=/opt/openwisp2/env python-path=/opt/openwisp2
+    WSGIProcessGroup openwisp
+    WSGIScriptAlias / /opt/openwisp2/openwisp2/wsgi.py
+
+    Alias /static/ /opt/openwisp2/static/
+    <Directory /opt/openwisp2/static>
+        Require all granted
+        Options FollowSymLinks
+    </Directory>
+
+    Alias /media/ /opt/openwisp2/media/
+    <Directory /opt/openwisp2/media>
+        Require all granted
+        Options FollowSymLinks
+    </Directory>
+
+    <Directory /opt/openwisp2/openwisp2>
+        <Files wsgi.py>
+            Require all granted
+        </Files>
+    </Directory>
+
+    ErrorLog ${APACHE_LOG_DIR}/openwisp_error.log
+    CustomLog ${APACHE_LOG_DIR}/openwisp_access.log combined
+</VirtualHost>
