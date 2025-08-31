@@ -1,0 +1,6 @@
+# roles/db/tasks/main.yml
+- name: Install PostgreSQL
+  apt:
+    name: postgresql
+    state: present
+    update_cache: yes

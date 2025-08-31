@@ -1,0 +1,7 @@
+# site.yml
+- hosts: all
+  become: yes
+  roles:
+    - role: db
+    - role: openwisp
+    - role: vpn

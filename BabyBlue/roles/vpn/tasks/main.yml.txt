@@ -1,0 +1,6 @@
+# roles/vpn/tasks/main.yml
+- name: Ensure WireGuard is installed
+  apt:
+    name: wireguard
+    state: present
+    update_cache: yes

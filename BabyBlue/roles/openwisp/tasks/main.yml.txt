@@ -1,0 +1,9 @@
+# roles/openwisp/tasks/main.yml
+- name: Install dependencies
+  apt:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - python3-pip
+    - python3-venv
+    - build-essential
