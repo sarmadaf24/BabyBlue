@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# همیشه غیرتعاملی
+export DEBIAN_FRONTEND=noninteractive
+
 # ====== Vars ======
 APP_DIR="${APP_DIR:-/opt/openwisp2}"
 REPO_URL="${REPO_URL:-https://github.com/sarmadaf24/BabyBlue.git}"
@@ -16,18 +19,26 @@ DJANGO_SUPERUSER_USERNAME="${DJANGO_SUPERUSER_USERNAME:-admin}"
 DJANGO_SUPERUSER_EMAIL="${DJANGO_SUPERUSER_EMAIL:-${EMAIL}}"
 DJANGO_SUPERUSER_PASSWORD="${DJANGO_SUPERUSER_PASSWORD:-ChangeMe!123}"
 
+echo "[0/9] Preseed برای جلوگیری از هر Prompt تعاملی (iptables-persistent, postfix)..."
+sudo bash -lc "
+  echo 'iptables-persistent iptables-persistent/autosave_v4 boolean false' | debconf-set-selections
+  echo 'iptables-persistent iptables-persistent/autosave_v6 boolean false' | debconf-set-selections
+  echo 'postfix postfix/main_mailer_type select Local only' | debconf-set-selections
+  echo 'postfix postfix/mailname string ${DOMAIN}' | debconf-set-selections
+"
+
 echo "[1/9] APT update/upgrade و نصب پکیج‌ها..."
-export DEBIAN_FRONTEND=noninteractive
-sudo apt update
-sudo apt -y upgrade
-sudo apt -y install \
+sudo -E apt-get update
+sudo -E apt-get -y upgrade
+sudo -E apt-get -o Dpkg::Options::='--force-confnew' -y install \
   python3 python3-venv python3-pip git curl jq \
   apache2 libapache2-mod-wsgi-py3 \
   certbot python3-certbot-apache \
   ufw iptables-persistent netfilter-persistent nftables \
   supervisor redis-server \
   nginx openvpn easy-rsa wireguard freeradius \
-  qemu-guest-agent mailutils tree sshpass build-essential \
+  postfix mailutils \
+  qemu-guest-agent tree sshpass build-essential \
   influxdb || true
 
 echo "[2/9] فایروال و IP forward..."
@@ -133,6 +144,7 @@ sudo apachectl configtest
 sudo systemctl reload apache2
 
 echo "[9/9] SSL Let’s Encrypt + Health-check..."
+sudo systemctl restart apache2
 sudo certbot --apache -d "${DOMAIN}" -d "www.${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}" --redirect || true
 sleep 2
 curl -I --max-time 10 "https://${DOMAIN}/admin/login/" || true
