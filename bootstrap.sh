@@ -7,7 +7,7 @@ APP_DIR="${APP_DIR:-/opt/openwisp2}"
 REPO_URL="${REPO_URL:-https://github.com/sarmadaf24/BabyBlue.git}"
 BRANCH="${BRANCH:-main}"
 OLD_DOMAIN="${OLD_DOMAIN:-baby.bluenet.click}"
-SECRETS_URL="${SECRETS_URL:-}"   # optional tar.gz with /opt/openwisp2/db.sqlite3, /opt/openwisp2/media, VPN keys, ...
+SECRETS_URL="${SECRETS_URL:-}"
 
 # Prompt DOMAIN even under curl|bash
 if [ -z "${DOMAIN:-}" ]; then
@@ -16,15 +16,15 @@ fi
 [ -n "${DOMAIN:-}" ] || { echo "ERROR: DOMAIN is empty. export DOMAIN=example.com"; exit 1; }
 EMAIL="${EMAIL:-admin@${DOMAIN}}"
 
-# Optional overrides (if Django repo has custom paths)
-MANAGE_PATH="${MANAGE_PATH:-}"   # e.g. /opt/openwisp2/src/manage.py
-WSGI_PATH="${WSGI_PATH:-}"       # e.g. /opt/openwisp2/config/wsgi.py
+# Optional overrides (if Django exists)
+MANAGE_PATH="${MANAGE_PATH:-}"
+WSGI_PATH="${WSGI_PATH:-}"
 
 DJANGO_SUPERUSER_USERNAME="${DJANGO_SUPERUSER_USERNAME:-admin}"
 DJANGO_SUPERUSER_EMAIL="${DJANGO_SUPERUSER_EMAIL:-${EMAIL}}"
 DJANGO_SUPERUSER_PASSWORD="${DJANGO_SUPERUSER_PASSWORD:-ChangeMe!123}"
 
-echo "[0/12] Preseed (no interactive prompts)"
+echo "[0/12] Non-interactive preseeds"
 sudo bash -lc "
   echo 'iptables-persistent iptables-persistent/autosave_v4 boolean false' | debconf-set-selections
   echo 'iptables-persistent iptables-persistent/autosave_v6 boolean false' | debconf-set-selections
@@ -32,7 +32,18 @@ sudo bash -lc "
   echo 'postfix postfix/mailname string ${DOMAIN}' | debconf-set-selections
 "
 
-echo "[1/12] APT install/update"
+# Fix mirrors on arm64
+ARCH="$(dpkg --print-architecture || echo amd64)"
+if [ "${ARCH}" = "arm64" ]; then
+  sudo tee /etc/apt/sources.list >/dev/null <<'EOF'
+deb http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
+deb http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
+deb http://ports.ubuntu.com/ubuntu-ports jammy-backports main restricted universe multiverse
+deb http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse
+EOF
+fi
+
+echo "[1/12] Apt install/update"
 sudo -E apt-get update
 sudo -E apt-get -y upgrade
 sudo -E apt-get -o Dpkg::Options::='--force-confnew' -y install \
@@ -43,8 +54,7 @@ sudo -E apt-get -o Dpkg::Options::='--force-confnew' -y install \
   supervisor redis-server \
   nginx openvpn easy-rsa wireguard \
   freeradius postfix mailutils \
-  qemu-guest-agent tree sshpass build-essential \
-  influxdb uwsgi uwsgi-plugin-python3 || true
+  qemu-guest-agent tree sshpass build-essential || true
 
 echo "[2/12] UFW + ip_forward"
 sudo ufw allow OpenSSH
@@ -85,7 +95,13 @@ echo "[5/12] venv + requirements"
 cd "${APP_DIR}"
 python3 -m venv venv
 source venv/bin/activate
-pip install --upgrade pip
+pip install --upgrade pip wheel
+
+# Core deps (Django + OpenWISP stack)
+pip install "Django>=4.2,<5" djangorestframework dj-rest-auth django-allauth \
+            openwisp-users openwisp-controller openwisp-radius
+
+# If project has requirements.txt, install it too
 [ -f requirements.txt ] && pip install -r requirements.txt || true
 
 echo "[6/12] (optional) restore secrets"
@@ -106,26 +122,118 @@ if [ "${DOMAIN}" != "${OLD_DOMAIN}" ]; then
   \) -not -path "*/venv/*" -not -path "*/.git/*" -print0 | xargs -0 -r sed -i \
     -e "s/${OLD_DOMAIN//\./\\.}/${DOMAIN//\./\\.}/g" \
     -e "s/www\.${OLD_DOMAIN//\./\\.}/www.${DOMAIN//\./\\.}/g"
-else
-  echo "Skip replace (DOMAIN == OLD_DOMAIN)"
 fi
 
-echo "[8/12] Django steps if available; else static vhost"
-# Detect manage.py deeply
+echo "[8/12] Django/OpenWISP: create if missing; migrate; vhost"
+# Auto-detect manage.py; else create project with OpenWISP apps
 if [ -z "${MANAGE_PATH}" ]; then
   MANAGE_PATH="$(find "${APP_DIR}" -maxdepth 12 -type f -name manage.py -not -path '*/venv/*' -not -path '*/.git/*' | head -n1 || true)"
 fi
-VHOST_FILE="/etc/apache2/sites-available/${DOMAIN}.conf"
-if [ -n "${MANAGE_PATH}" ] && [ -f "${MANAGE_PATH}" ]; then
-  DJANGO_DIR="$(dirname "${MANAGE_PATH}")"
-  echo "MANAGE_PATH=${MANAGE_PATH}"
-  echo "DJANGO_DIR=${DJANGO_DIR}"
-  source "${APP_DIR}/venv/bin/activate"
-  cd "${DJANGO_DIR}"
-  python manage.py migrate --noinput
-  python manage.py collectstatic --noinput
-  export DJANGO_SUPERUSER_USERNAME DJANGO_SUPERUSER_EMAIL DJANGO_SUPERUSER_PASSWORD
-  python manage.py shell <<'PYCODE'
+if [ -z "${MANAGE_PATH}" ]; then
+  echo "No manage.py found → creating OpenWISP Django project"
+  mkdir -p "${APP_DIR}/app"
+  pushd "${APP_DIR}/app" >/dev/null
+  django-admin startproject openwisp_proj .
+  popd >/dev/null
+
+  SETTINGS="${APP_DIR}/app/openwisp_proj/settings.py"
+  WSGI_PATH="${APP_DIR}/app/openwisp_proj/wsgi.py"
+  SECRET="$(python - <<'PY'
+import secrets, string
+alphabet=string.ascii_letters+string.digits+string.punctuation
+print(secrets.token_urlsafe(48))
+PY
+)"
+  cat > "${SETTINGS}" <<EOF
+import os
+from pathlib import Path
+BASE_DIR = Path(__file__).resolve().parent.parent
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', '${SECRET}')
+DEBUG = False
+ALLOWED_HOSTS = ['${DOMAIN}', 'www.${DOMAIN}', '127.0.0.1', 'localhost']
+
+INSTALLED_APPS = [
+    'django.contrib.admin','django.contrib.auth','django.contrib.contenttypes',
+    'django.contrib.sessions','django.contrib.messages','django.contrib.staticfiles',
+    'django.contrib.sites',
+    'rest_framework',
+    'allauth','allauth.account','allauth.socialaccount',
+    'dj_rest_auth',
+    'openwisp_users',
+    'openwisp_controller',
+    'openwisp_radius',
+]
+MIDDLEWARE = [
+    'django.middleware.security.SecurityMiddleware',
+    'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.middleware.common.CommonMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'allauth.account.middleware.AccountMiddleware',
+    'django.contrib.messages.middleware.MessageMiddleware',
+    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+]
+ROOT_URLCONF = 'openwisp_proj.urls'
+TEMPLATES = [{
+    'BACKEND': 'django.template.backends.django.DjangoTemplates',
+    'DIRS': [], 'APP_DIRS': True,
+    'OPTIONS': {'context_processors': [
+        'django.template.context_processors.debug',
+        'django.template.context_processors.request',
+        'django.contrib.auth.context_processors.auth',
+        'django.contrib.messages.context_processors.messages',
+    ]},
+}]
+WSGI_APPLICATION = 'openwisp_proj.wsgi.application'
+DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3','NAME': BASE_DIR / 'db.sqlite3'}}
+AUTH_PASSWORD_VALIDATORS = []
+LANGUAGE_CODE = 'en-us'; TIME_ZONE = 'UTC'; USE_I18N = True; USE_TZ = True
+STATIC_URL = '/static/'; STATIC_ROOT = os.path.join(BASE_DIR,'static')
+MEDIA_URL = '/media/'; MEDIA_ROOT = os.path.join(BASE_DIR,'media')
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+SITE_ID = 1
+AUTH_USER_MODEL = 'openwisp_users.User'
+ACCOUNT_EMAIL_VERIFICATION = 'none'
+ACCOUNT_AUTHENTICATION_METHOD = 'username'
+ACCOUNT_EMAIL_REQUIRED = False
+EOF
+
+  cat > "${APP_DIR}/app/openwisp_proj/urls.py" <<'EOF'
+from django.contrib import admin
+from django.urls import path, include
+from django.conf import settings
+from django.conf.urls.static import static
+
+urlpatterns = [
+    path('admin/', admin.site.urls),
+    path('accounts/', include('allauth.urls')),
+]
+urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+EOF
+
+  MANAGE_PATH="${APP_DIR}/app/manage.py"
+  # create manage.py if not exists
+  if [ ! -f "${MANAGE_PATH}" ]; then
+    cat > "${MANAGE_PATH}" <<'EOF'
+#!/usr/bin/env python3
+import os, sys
+if __name__ == "__main__":
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "openwisp_proj.settings")
+    from django.core.management import execute_from_command_line
+    execute_from_command_line(sys.argv)
+EOF
+    chmod +x "${MANAGE_PATH}"
+  fi
+fi
+
+# migrate / collectstatic / superuser
+DJANGO_DIR="$(dirname "${MANAGE_PATH}")"
+source "${APP_DIR}/venv/bin/activate"
+cd "${DJANGO_DIR}"
+python manage.py migrate --noinput
+python manage.py collectstatic --noinput
+export DJANGO_SUPERUSER_USERNAME DJANGO_SUPERUSER_EMAIL DJANGO_SUPERUSER_PASSWORD
+python manage.py shell <<'PYCODE'
 from django.contrib.auth import get_user_model
 import os
 User = get_user_model()
@@ -136,73 +244,42 @@ u, created = User.objects.get_or_create(
 if created:
     u.set_password(os.environ["DJANGO_SUPERUSER_PASSWORD"]); u.save()
 PYCODE
-  # Detect WSGI
-  if [ -z "${WSGI_PATH}" ]; then
-    WSGI_PATH="${APP_DIR}/config/wsgi.py"
-    [ -f "${WSGI_PATH}" ] || WSGI_PATH="$(find "${APP_DIR}" -maxdepth 12 -type f -name wsgi.py -not -path '*/venv/*' -not -path '*/.git/*' | head -n1 || true)"
-  fi
-  [ -n "${WSGI_PATH}" ] && [ -f "${WSGI_PATH}" ] || { echo "ERROR: wsgi.py not found"; exit 1; }
-  STATIC_DIR="${DJANGO_DIR}/static"
-  MEDIA_DIR="${DJANGO_DIR}/media"
-  sudo tee "${VHOST_FILE}" >/dev/null <<APACHECONF
+
+# WSGI detect if not set
+if [ -z "${WSGI_PATH}" ]; then
+  WSGI_PATH="$(find "${APP_DIR}" -maxdepth 12 -type f -name wsgi.py -not -path '*/venv/*' -not -path '*/.git/*' | head -n1 || true)"
+fi
+[ -n "${WSGI_PATH}" ] && [ -f "${WSGI_PATH}" ] || { echo "ERROR: wsgi.py not found"; exit 1; }
+STATIC_DIR="${DJANGO_DIR}/static"
+MEDIA_DIR="${DJANGO_DIR}/media"
+VHOST_FILE="/etc/apache2/sites-available/${DOMAIN}.conf"
+sudo tee "${VHOST_FILE}" >/dev/null <<APACHECONF
 <VirtualHost *:80>
     ServerName ${DOMAIN}
     ServerAlias www.${DOMAIN}
-
     WSGIDaemonProcess babyblue python-home=${APP_DIR}/venv python-path=${APP_DIR}
     WSGIProcessGroup babyblue
     WSGIScriptAlias / ${WSGI_PATH}
-
     Alias /static ${STATIC_DIR}
-    <Directory ${STATIC_DIR}>
-        Require all granted
-    </Directory>
-
+    <Directory ${STATIC_DIR}>Require all granted</Directory>
     Alias /media ${MEDIA_DIR}
-    <Directory ${MEDIA_DIR}>
-        Require all granted
-    </Directory>
-
-    <Directory "$(dirname "${WSGI_PATH}")">
-        <Files wsgi.py>
-            Require all granted
-        </Files>
-    </Directory>
-
+    <Directory ${MEDIA_DIR}>Require all granted</Directory>
+    <Directory "$(dirname "${WSGI_PATH}")"><Files wsgi.py>Require all granted</Files></Directory>
     ErrorLog \${APACHE_LOG_DIR}/${DOMAIN}_error.log
     CustomLog \${APACHE_LOG_DIR}/${DOMAIN}_access.log combined
 </VirtualHost>
 APACHECONF
-else
-  echo "No manage.py found → static landing vhost."
-  DOCROOT="/var/www/${DOMAIN}/html"
-  sudo mkdir -p "${DOCROOT}"
-  echo "<h1>${DOMAIN}</h1>" | sudo tee "${DOCROOT}/index.html" >/dev/null
-  sudo tee "${VHOST_FILE}" >/dev/null <<APACHECONF
-<VirtualHost *:80>
-    ServerName ${DOMAIN}
-    ServerAlias www.${DOMAIN}
-    DocumentRoot ${DOCROOT}
-    <Directory ${DOCROOT}>
-        Require all granted
-        Options -Indexes
-    </Directory>
-    ErrorLog \${APACHE_LOG_DIR}/${DOMAIN}_error.log
-    CustomLog \${APACHE_LOG_DIR}/${DOMAIN}_access.log combined
-</VirtualHost>
-APACHECONF
-fi
 sudo a2ensite "${DOMAIN}.conf"
 sudo a2dissite 000-default.conf default-ssl.conf 2>/dev/null || true
 sudo apachectl configtest
 sudo systemctl restart apache2
 
-echo "[9/12] SSL (Let's Encrypt) + redirect"
+echo "[9/12] SSL (Let's Encrypt)"
 DOMS=(-d "${DOMAIN}")
 if getent hosts "www.${DOMAIN}" >/dev/null 2>&1; then DOMS+=(-d "www.${DOMAIN}"); fi
 sudo certbot --apache "${DOMS[@]}" --non-interactive --agree-tos -m "${EMAIL}" --redirect || true
 
-echo "[10/12] WireGuard (wg0 10.99.0.1/24, 51820/udp) + NAT"
+echo "[10/12] WireGuard (wg0 10.99.0.1/24)"
 WAN_IF="$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
 sudo install -d -m 0700 /etc/wireguard
 [ -f /etc/wireguard/server_private.key ] || (umask 077; wg genkey | sudo tee /etc/wireguard/server_private.key >/dev/null)
@@ -220,7 +297,7 @@ EOF
 sudo systemctl enable --now wg-quick@wg0
 sudo iptables -t nat -C POSTROUTING -s 10.99.0.0/24 -o "${WAN_IF}" -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s 10.99.0.0/24 -o "${WAN_IF}" -j MASQUERADE
 
-echo "[11/12] OpenVPN (10.99.1.0/24, 1194/udp) + PKI"
+echo "[11/12] OpenVPN (10.99.1.0/24)"
 export EASYRSA_BATCH=1
 if [ ! -f /etc/openvpn/ca.crt ]; then
   sudo rm -rf /etc/openvpn/easy-rsa
@@ -267,10 +344,8 @@ verb 3
 EOF
 sudo systemctl enable --now openvpn@server
 
-echo "[12/12] Persist NAT rules"
+echo "[12/12] Persist NAT & health"
 sudo netfilter-persistent save || true
-
-# Health
 echo "== Apache =="
 sudo apachectl -S || true
 echo "== Ports =="
@@ -279,5 +354,4 @@ echo "== WireGuard =="
 sudo wg show || true
 echo "== OpenVPN =="
 sudo systemctl status openvpn@server --no-pager || true
-
 echo "✅ FULL DONE: https://${DOMAIN}"
