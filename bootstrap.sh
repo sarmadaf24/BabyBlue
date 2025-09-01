@@ -9,7 +9,7 @@ BRANCH="${BRANCH:-main}"
 OLD_DOMAIN="${OLD_DOMAIN:-baby.bluenet.click}"
 SECRETS_URL="${SECRETS_URL:-}"
 
-# Prompt domain even under curl|bash
+# Prompt DOMAIN even under curl|bash
 if [ -z "${DOMAIN:-}" ]; then
   if [ -r /dev/tty ]; then
     read -rp "Enter NEW domain (e.g. example.com): " DOMAIN </dev/tty
@@ -20,7 +20,7 @@ if [ -z "${DOMAIN:-}" ]; then
 fi
 EMAIL="${EMAIL:-admin@${DOMAIN}}"
 
-# Optional overrides if Django exists elsewhere
+# Optional override paths
 MANAGE_PATH="${MANAGE_PATH:-}"   # e.g. /opt/openwisp2/src/manage.py
 WSGI_PATH="${WSGI_PATH:-}"       # e.g. /opt/openwisp2/config/wsgi.py
 
@@ -28,7 +28,7 @@ DJANGO_SUPERUSER_USERNAME="${DJANGO_SUPERUSER_USERNAME:-admin}"
 DJANGO_SUPERUSER_EMAIL="${DJANGO_SUPERUSER_EMAIL:-${EMAIL}}"
 DJANGO_SUPERUSER_PASSWORD="${DJANGO_SUPERUSER_PASSWORD:-ChangeMe!123}"
 
-echo "[0/10] Preseed (no interactive prompts)"
+echo "[0/10] Preseed (no prompts)"
 sudo bash -lc "
   echo 'iptables-persistent iptables-persistent/autosave_v4 boolean false' | debconf-set-selections
   echo 'iptables-persistent iptables-persistent/autosave_v6 boolean false' | debconf-set-selections
@@ -58,7 +58,7 @@ sudo ufw --force enable
 echo "net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/99-ipforward.conf >/dev/null
 sudo sysctl -p /etc/sysctl.d/99-ipforward.conf
 
-echo "[3/10] Free port 80 for Apache (no races)"
+echo "[3/10] Free :80 for Apache (robust)"
 sudo systemctl stop nginx || true
 sudo systemctl disable nginx || true
 sudo systemctl mask nginx || true
@@ -95,7 +95,7 @@ if [ -n "${SECRETS_URL}" ]; then
   rm -f "${TMP_SECRETS}"
 fi
 
-echo "[7/10] Replace OLD_DOMAIN → DOMAIN in text files (safe)"
+echo "[7/10] Replace OLD_DOMAIN → DOMAIN (safe)"
 if [ "${DOMAIN}" != "${OLD_DOMAIN}" ]; then
   find "${APP_DIR}" -type f \( \
     -name "*.py" -o -name "*.conf" -o -name "*.env" -o -name "*.json" -o \
@@ -109,10 +109,12 @@ else
   echo "Skip replace (DOMAIN == OLD_DOMAIN)"
 fi
 
-echo "[8/10] Django steps (auto-skip if manage.py not found)"
+echo "[8/10] Django steps if available; else fallback to static vhost"
+# Detect manage.py deeply; do NOT fail if missing
 if [ -z "${MANAGE_PATH}" ]; then
   MANAGE_PATH="$(find "${APP_DIR}" -maxdepth 12 -type f -name manage.py -not -path '*/venv/*' -not -path '*/.git/*' | head -n1 || true)"
 fi
+
 if [ -n "${MANAGE_PATH}" ] && [ -f "${MANAGE_PATH}" ]; then
   DJANGO_DIR="$(dirname "${MANAGE_PATH}")"
   echo "MANAGE_PATH=${MANAGE_PATH}"
@@ -133,7 +135,8 @@ u, created = User.objects.get_or_create(
 if created:
     u.set_password(os.environ["DJANGO_SUPERUSER_PASSWORD"]); u.save()
 PYCODE
-  # Detect WSGI
+
+  # Detect WSGI path
   if [ -z "${WSGI_PATH}" ]; then
     WSGI_PATH="${APP_DIR}/config/wsgi.py"
     [ -f "${WSGI_PATH}" ] || WSGI_PATH="$(find "${APP_DIR}" -maxdepth 12 -type f -name wsgi.py -not -path '*/venv/*' -not -path '*/.git/*' | head -n1 || true)"
