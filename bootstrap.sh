@@ -9,24 +9,26 @@ BRANCH="${BRANCH:-main}"
 OLD_DOMAIN="${OLD_DOMAIN:-baby.bluenet.click}"
 SECRETS_URL="${SECRETS_URL:-}"
 
-# Prompt domain if not provided
+# Prompt domain even under curl|bash
 if [ -z "${DOMAIN:-}" ]; then
-  read -rp "Enter NEW domain (e.g. example.com): " DOMAIN
+  if [ -r /dev/tty ]; then
+    read -rp "Enter NEW domain (e.g. example.com): " DOMAIN </dev/tty
+  fi
 fi
-if [ -z "${DOMAIN}" ]; then
-  echo "ERROR: DOMAIN is empty."; exit 1
+if [ -z "${DOMAIN:-}" ]; then
+  echo "ERROR: DOMAIN is empty. export DOMAIN=example.com then rerun."; exit 1
 fi
 EMAIL="${EMAIL:-admin@${DOMAIN}}"
 
-# (Optional) override paths if repo ساختار خاص دارد
-MANAGE_PATH="${MANAGE_PATH:-}"   # مثال: /opt/openwisp2/src/manage.py
-WSGI_PATH="${WSGI_PATH:-}"       # مثال: /opt/openwisp2/config/wsgi.py
+# Optional overrides if Django exists elsewhere
+MANAGE_PATH="${MANAGE_PATH:-}"   # e.g. /opt/openwisp2/src/manage.py
+WSGI_PATH="${WSGI_PATH:-}"       # e.g. /opt/openwisp2/config/wsgi.py
 
 DJANGO_SUPERUSER_USERNAME="${DJANGO_SUPERUSER_USERNAME:-admin}"
 DJANGO_SUPERUSER_EMAIL="${DJANGO_SUPERUSER_EMAIL:-${EMAIL}}"
 DJANGO_SUPERUSER_PASSWORD="${DJANGO_SUPERUSER_PASSWORD:-ChangeMe!123}"
 
-echo "[0/10] Preseed (no prompts)"
+echo "[0/10] Preseed (no interactive prompts)"
 sudo bash -lc "
   echo 'iptables-persistent iptables-persistent/autosave_v4 boolean false' | debconf-set-selections
   echo 'iptables-persistent iptables-persistent/autosave_v6 boolean false' | debconf-set-selections
@@ -56,11 +58,11 @@ sudo ufw --force enable
 echo "net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/99-ipforward.conf >/dev/null
 sudo sysctl -p /etc/sysctl.d/99-ipforward.conf
 
-echo "[3/10] Release :80 for Apache"
+echo "[3/10] Free port 80 for Apache (no races)"
 sudo systemctl stop nginx || true
 sudo systemctl disable nginx || true
 sudo systemctl mask nginx || true
-sudo bash -lc "ss -ltnp | awk '\$4 ~ /:80$/' | awk '{print \$NF}' | sed 's/pid=//;s/,.*//' | xargs -r kill -9" || true
+sudo fuser -k 80/tcp || true
 sudo a2enmod wsgi headers rewrite
 sudo systemctl enable --now apache2
 sudo systemctl enable --now supervisor
@@ -93,7 +95,7 @@ if [ -n "${SECRETS_URL}" ]; then
   rm -f "${TMP_SECRETS}"
 fi
 
-echo "[7/10] Domain replace in project (only if different)"
+echo "[7/10] Replace OLD_DOMAIN → DOMAIN in text files (safe)"
 if [ "${DOMAIN}" != "${OLD_DOMAIN}" ]; then
   find "${APP_DIR}" -type f \( \
     -name "*.py" -o -name "*.conf" -o -name "*.env" -o -name "*.json" -o \
@@ -104,27 +106,23 @@ if [ "${DOMAIN}" != "${OLD_DOMAIN}" ]; then
     -e "s/${OLD_DOMAIN//\./\\.}/${DOMAIN//\./\\.}/g" \
     -e "s/www\.${OLD_DOMAIN//\./\\.}/www.${DOMAIN//\./\\.}/g"
 else
-  echo "Skip replace: DOMAIN equals OLD_DOMAIN (${DOMAIN})"
+  echo "Skip replace (DOMAIN == OLD_DOMAIN)"
 fi
 
-echo "[8/10] Detect manage.py / migrate / collectstatic / superuser"
+echo "[8/10] Django steps (auto-skip if manage.py not found)"
 if [ -z "${MANAGE_PATH}" ]; then
-  MANAGE_PATH="$(find "${APP_DIR}" -maxdepth 8 -type f -name manage.py \
-    -not -path '*/venv/*' -not -path '*/.git/*' | head -n1 || true)"
+  MANAGE_PATH="$(find "${APP_DIR}" -maxdepth 12 -type f -name manage.py -not -path '*/venv/*' -not -path '*/.git/*' | head -n1 || true)"
 fi
-if [ -z "${MANAGE_PATH}" ] || [ ! -f "${MANAGE_PATH}" ]; then
-  echo "ERROR: manage.py not found under ${APP_DIR}"; exit 1
-fi
-DJANGO_DIR="$(dirname "${MANAGE_PATH}")"
-echo "MANAGE_PATH=${MANAGE_PATH}"
-echo "DJANGO_DIR=${DJANGO_DIR}"
-
-source "${APP_DIR}/venv/bin/activate"
-cd "${DJANGO_DIR}"
-python manage.py migrate --noinput
-python manage.py collectstatic --noinput
-export DJANGO_SUPERUSER_USERNAME DJANGO_SUPERUSER_EMAIL DJANGO_SUPERUSER_PASSWORD
-python manage.py shell <<'PYCODE'
+if [ -n "${MANAGE_PATH}" ] && [ -f "${MANAGE_PATH}" ]; then
+  DJANGO_DIR="$(dirname "${MANAGE_PATH}")"
+  echo "MANAGE_PATH=${MANAGE_PATH}"
+  echo "DJANGO_DIR=${DJANGO_DIR}"
+  source "${APP_DIR}/venv/bin/activate"
+  cd "${DJANGO_DIR}"
+  python manage.py migrate --noinput
+  python manage.py collectstatic --noinput
+  export DJANGO_SUPERUSER_USERNAME DJANGO_SUPERUSER_EMAIL DJANGO_SUPERUSER_PASSWORD
+  python manage.py shell <<'PYCODE'
 from django.contrib.auth import get_user_model
 import os
 User = get_user_model()
@@ -135,20 +133,18 @@ u, created = User.objects.get_or_create(
 if created:
     u.set_password(os.environ["DJANGO_SUPERUSER_PASSWORD"]); u.save()
 PYCODE
-
-echo "[9/10] Apache vhost + WSGI (auto-detect or override)"
-if [ -z "${WSGI_PATH}" ]; then
-  WSGI_PATH="${APP_DIR}/config/wsgi.py"
-  [ -f "${WSGI_PATH}" ] || WSGI_PATH="$(find "${APP_DIR}" -maxdepth 8 -type f -name wsgi.py \
-    -not -path '*/venv/*' -not -path '*/.git/*' | head -n1 || true)"
-fi
-if [ -z "${WSGI_PATH}" ] || [ ! -f "${WSGI_PATH}" ]; then
-  echo "ERROR: wsgi.py not found under ${APP_DIR}"; exit 1
-fi
-STATIC_DIR="${DJANGO_DIR}/static"
-MEDIA_DIR="${DJANGO_DIR}/media"
-
-sudo tee "/etc/apache2/sites-available/${DOMAIN}.conf" >/dev/null <<APACHECONF
+  # Detect WSGI
+  if [ -z "${WSGI_PATH}" ]; then
+    WSGI_PATH="${APP_DIR}/config/wsgi.py"
+    [ -f "${WSGI_PATH}" ] || WSGI_PATH="$(find "${APP_DIR}" -maxdepth 12 -type f -name wsgi.py -not -path '*/venv/*' -not -path '*/.git/*' | head -n1 || true)"
+  fi
+  if [ -z "${WSGI_PATH}" ] || [ ! -f "${WSGI_PATH}" ]; then
+    echo "ERROR: wsgi.py not found; cannot configure WSGI vhost."; exit 1
+  fi
+  STATIC_DIR="${DJANGO_DIR}/static"
+  MEDIA_DIR="${DJANGO_DIR}/media"
+  VHOST_FILE="/etc/apache2/sites-available/${DOMAIN}.conf"
+  sudo tee "${VHOST_FILE}" >/dev/null <<APACHECONF
 <VirtualHost *:80>
     ServerName ${DOMAIN}
     ServerAlias www.${DOMAIN}
@@ -177,7 +173,27 @@ sudo tee "/etc/apache2/sites-available/${DOMAIN}.conf" >/dev/null <<APACHECONF
     CustomLog \${APACHE_LOG_DIR}/${DOMAIN}_access.log combined
 </VirtualHost>
 APACHECONF
+else
+  echo "No manage.py found → configuring static landing vhost."
+  VHOST_FILE="/etc/apache2/sites-available/${DOMAIN}.conf"
+  sudo mkdir -p "/var/www/${DOMAIN}/html"
+  echo "<h1>OK: ${DOMAIN}</h1>" | sudo tee "/var/www/${DOMAIN}/html/index.html" >/dev/null
+  sudo tee "${VHOST_FILE}" >/dev/null <<APACHECONF
+<VirtualHost *:80>
+    ServerName ${DOMAIN}
+    ServerAlias www.${DOMAIN}
+    DocumentRoot /var/www/${DOMAIN}/html
+    <Directory /var/www/${DOMAIN}/html>
+        Require all granted
+        Options -Indexes
+    </Directory>
+    ErrorLog \${APACHE_LOG_DIR}/${DOMAIN}_error.log
+    CustomLog \${APACHE_LOG_DIR}/${DOMAIN}_access.log combined
+</VirtualHost>
+APACHECONF
+fi
 
+echo "[9/10] Enable vhost + restart Apache"
 sudo a2ensite "${DOMAIN}.conf"
 sudo a2dissite 000-default.conf || true
 sudo apachectl configtest
@@ -186,6 +202,7 @@ sudo systemctl restart apache2
 echo "[10/10] SSL (Let's Encrypt) + health-check"
 sudo certbot --apache -d "${DOMAIN}" -d "www.${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}" --redirect || true
 sleep 2
+curl -I --max-time 10 "https://${DOMAIN}/" || true
 curl -I --max-time 10 "https://${DOMAIN}/admin/login/" || true
 
 echo "✅ DONE: https://${DOMAIN}"
