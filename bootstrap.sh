@@ -8,19 +8,24 @@ BRANCH="${BRANCH:-main}"
 OLD_DOMAIN="${OLD_DOMAIN:-baby.bluenet.click}"
 SECRETS_URL="${SECRETS_URL:-}"
 
-if [ -z "${DOMAIN:-}" ]; then
-  if [ -r /dev/tty ]; then read -rp "Domain: " DOMAIN </dev/tty; fi
-fi
-[ -n "${DOMAIN:-}" ] || { echo "ERROR: DOMAIN is empty. export DOMAIN=example.com"; exit 1; }
+# ---- Prompts (works under curl|bash with /dev/tty) ----
+if [ -z "${DOMAIN:-}" ] && [ -r /dev/tty ]; then read -rp "Domain: " DOMAIN </dev/tty || true; fi
+[ -n "${DOMAIN:-}" ] || DOMAIN="example.local"
 EMAIL="${EMAIL:-admin@${DOMAIN}}"
+
+if [ -z "${DJANGO_SUPERUSER_USERNAME:-}" ] && [ -r /dev/tty ]; then read -rp "Django superuser [admin]: " DJANGO_SUPERUSER_USERNAME </dev/tty || true; fi
+[ -n "${DJANGO_SUPERUSER_USERNAME:-}" ] || DJANGO_SUPERUSER_USERNAME="admin"
+
+if [ -z "${DJANGO_SUPERUSER_EMAIL:-}" ] && [ -r /dev/tty ]; then read -rp "Superuser email [${EMAIL}]: " DJANGO_SUPERUSER_EMAIL </dev/tty || true; fi
+[ -n "${DJANGO_SUPERUSER_EMAIL:-}" ] || DJANGO_SUPERUSER_EMAIL="${EMAIL}"
+
+if [ -z "${DJANGO_SUPERUSER_PASSWORD:-}" ] && [ -r /dev/tty ]; then read -rsp "Superuser password [admin123]: " DJANGO_SUPERUSER_PASSWORD </dev/tty || true; echo; fi
+[ -n "${DJANGO_SUPERUSER_PASSWORD:-}" ] || DJANGO_SUPERUSER_PASSWORD="admin123"
 
 MANAGE_PATH="${MANAGE_PATH:-}"
 WSGI_PATH="${WSGI_PATH:-}"
 
-DJANGO_SUPERUSER_USERNAME="${DJANGO_SUPERUSER_USERNAME:-admin}"
-DJANGO_SUPERUSER_EMAIL="${DJANGO_SUPERUSER_EMAIL:-${EMAIL}}"
-DJANGO_SUPERUSER_PASSWORD="${DJANGO_SUPERUSER_PASSWORD:-ChangeMe!123}"
-
+# ---- Preseed to avoid interactive APT dialogs ----
 sudo bash -lc "
   echo 'iptables-persistent iptables-persistent/autosave_v4 boolean false' | debconf-set-selections
   echo 'iptables-persistent iptables-persistent/autosave_v6 boolean false' | debconf-set-selections
@@ -28,8 +33,9 @@ sudo bash -lc "
   echo 'postfix postfix/mailname string ${DOMAIN}' | debconf-set-selections
 "
 
-ARCH=\"$(dpkg --print-architecture || echo amd64)\"
-if [ \"${ARCH}\" = \"arm64\" ]; then
+# ---- Fix mirrors on arm64 (Jammy) ----
+ARCH="$(dpkg --print-architecture || echo amd64)"
+if [ "${ARCH}" = "arm64" ]; then
   sudo tee /etc/apt/sources.list >/dev/null <<'EOF'
 deb http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
 deb http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
@@ -38,6 +44,7 @@ deb http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe
 EOF
 fi
 
+echo "[1/12] APT install/update"
 sudo -E apt-get update
 sudo -E apt-get -y upgrade
 sudo -E apt-get -o Dpkg::Options::='--force-confnew' -y install \
@@ -45,11 +52,15 @@ sudo -E apt-get -o Dpkg::Options::='--force-confnew' -y install \
   apache2 libapache2-mod-wsgi-py3 \
   certbot python3-certbot-apache \
   ufw iptables-persistent netfilter-persistent nftables \
-  supervisor redis-server \
-  nginx openvpn easy-rsa wireguard \
-  freeradius postfix mailutils \
-  qemu-guest-agent tree sshpass build-essential || true
+  supervisor redis-server nginx \
+  openvpn easy-rsa wireguard freeradius postfix mailutils \
+  qemu-guest-agent tree sshpass build-essential \
+  libcairo2 libcairo-gobject2 libpango-1.0-0 libpangoft2-1.0-0 libpangocairo-1.0-0 \
+  libharfbuzz0b libthai0 libfribidi0 libgdk-pixbuf-2.0-0 libffi8 libxml2 libxslt1.1 \
+  libjpeg-turbo8 shared-mime-info fonts-dejavu-core fonts-liberation fonts-freefont-ttf || true
+sudo ldconfig
 
+echo "[2/12] UFW + ip_forward"
 sudo ufw allow OpenSSH
 sudo ufw allow 80
 sudo ufw allow 443
@@ -59,6 +70,7 @@ sudo ufw --force enable
 echo "net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/99-ipforward.conf >/dev/null
 sudo sysctl -p /etc/sysctl.d/99-ipforward.conf
 
+echo "[3/12] Apache owns 80/443"
 sudo systemctl stop nginx || true
 sudo systemctl disable nginx || true
 sudo systemctl mask nginx || true
@@ -72,6 +84,7 @@ sudo systemctl enable --now supervisor
 sudo systemctl enable --now redis-server
 (sudo systemctl enable --now ssh || sudo systemctl enable --now sshd) || true
 
+echo "[4/12] Clone/Pull → ${APP_DIR}"
 sudo mkdir -p "${APP_DIR}"
 sudo chown "$USER":"$USER" "${APP_DIR}"
 if [ ! -d "${APP_DIR}/.git" ]; then
@@ -82,14 +95,17 @@ else
   git -C "${APP_DIR}" reset --hard "origin/${BRANCH}"
 fi
 
+echo "[5/12] venv + pip deps"
 cd "${APP_DIR}"
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip wheel
 pip install "Django>=4.2,<5" djangorestframework dj-rest-auth django-allauth \
-            openwisp-users openwisp-controller openwisp-radius
+            openwisp-users openwisp-controller openwisp-radius \
+            django-private-storage weasyprint
 [ -f requirements.txt ] && pip install -r requirements.txt || true
 
+echo "[6/12] (optional) restore secrets"
 if [ -n "${SECRETS_URL}" ]; then
   TMP_SECRETS="/tmp/secrets.tar.gz"
   curl -fsSL "${SECRETS_URL}" -o "${TMP_SECRETS}"
@@ -97,28 +113,29 @@ if [ -n "${SECRETS_URL}" ]; then
   rm -f "${TMP_SECRETS}"
 fi
 
+echo "[7/12] Replace old domain → ${DOMAIN}"
 if [ "${DOMAIN}" != "${OLD_DOMAIN}" ]; then
   find "${APP_DIR}" -type f \( -name "*.py" -o -name "*.conf" -o -name "*.env" -o -name "*.json" -o -name "*.yml" -o -name "*.yaml" -o -name "*.ini" -o -name "*.txt" -o -name "*.html" -o -name "*.htm" -o -name "*.css" -o -name "*.js" -o -name "*.service" \) \
-  -not -path "*/venv/*" -not -path "*/.git/*" -print0 | xargs -0 -r sed -i \
-  -e "s/${OLD_DOMAIN//\./\\.}/${DOMAIN//\./\\.}/g" \
-  -e "s/www\.${OLD_DOMAIN//\./\\.}/www.${DOMAIN//\./\\.}/g"
+   -not -path "*/venv/*" -not -path "*/.git/*" -print0 | xargs -0 -r sed -i \
+   -e "s/${OLD_DOMAIN//\./\\.}/${DOMAIN//\./\\.}/g" \
+   -e "s/www\.${OLD_DOMAIN//\./\\.}/www.${DOMAIN//\./\\.}/g"
 fi
 
+echo "[8/12] Django/OpenWISP project (create-or-patch)"
+# detect manage.py; else create base project
 if [ -z "${MANAGE_PATH}" ]; then
   MANAGE_PATH="$(find "${APP_DIR}" -maxdepth 12 -type f -name manage.py -not -path '*/venv/*' -not -path '*/.git/*' | head -n1 || true)"
 fi
-
 if [ -z "${MANAGE_PATH}" ]; then
   mkdir -p "${APP_DIR}/app"
   pushd "${APP_DIR}/app" >/dev/null
   django-admin startproject openwisp_proj .
   popd >/dev/null
-
+  MANAGE_PATH="${APP_DIR}/app/manage.py"
   SETTINGS="${APP_DIR}/app/openwisp_proj/settings.py"
   WSGI_PATH="${APP_DIR}/app/openwisp_proj/wsgi.py"
   SECRET="$(python - <<'PY'
-import secrets
-print(secrets.token_urlsafe(48))
+import secrets; print(secrets.token_urlsafe(48))
 PY
 )"
   cat > "${SETTINGS}" <<EOF
@@ -133,12 +150,11 @@ INSTALLED_APPS = [
     'django.contrib.admin','django.contrib.auth','django.contrib.contenttypes',
     'django.contrib.sessions','django.contrib.messages','django.contrib.staticfiles',
     'django.contrib.sites',
-    'rest_framework',
+    'rest_framework','rest_framework.authtoken',
     'allauth','allauth.account','allauth.socialaccount',
     'dj_rest_auth',
-    'openwisp_users',
-    'openwisp_controller',
-    'openwisp_radius',
+    'private_storage',
+    'openwisp_users','openwisp_controller','openwisp_radius',
 ]
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -152,9 +168,8 @@ MIDDLEWARE = [
 ]
 ROOT_URLCONF = 'openwisp_proj.urls'
 TEMPLATES = [{
-    'BACKEND': 'django.template.backends.django.DjangoTemplates',
-    'DIRS': [], 'APP_DIRS': True,
-    'OPTIONS': {'context_processors': [
+    'BACKEND':'django.template.backends.django.DjangoTemplates','DIRS':[],'APP_DIRS':True,
+    'OPTIONS':{'context_processors':[
         'django.template.context_processors.debug',
         'django.template.context_processors.request',
         'django.contrib.auth.context_processors.auth',
@@ -162,50 +177,66 @@ TEMPLATES = [{
     ]},
 }]
 WSGI_APPLICATION = 'openwisp_proj.wsgi.application'
-DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3','NAME': BASE_DIR / 'db.sqlite3'}}
-AUTH_PASSWORD_VALIDATORS = []
-LANGUAGE_CODE = 'en-us'; TIME_ZONE = 'UTC'; USE_I18N = True; USE_TZ = True
-STATIC_URL = '/static/'; STATIC_ROOT = os.path.join(BASE_DIR,'static')
-MEDIA_URL = '/media/'; MEDIA_ROOT = os.path.join(BASE_DIR,'media')
-PRIVATE_STORAGE_ROOT = os.path.join(BASE_DIR,'private')
-DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-SITE_ID = 1
-AUTH_USER_MODEL = 'openwisp_users.User'
-ACCOUNT_EMAIL_VERIFICATION = 'none'
-ACCOUNT_AUTHENTICATION_METHOD = 'username'
-ACCOUNT_EMAIL_REQUIRED = False
+DATABASES = {'default': {'ENGINE':'django.db.backends.sqlite3','NAME': BASE_DIR / 'db.sqlite3'}}
+LANGUAGE_CODE='en-us'; TIME_ZONE='UTC'; USE_I18N=True; USE_TZ=True
+STATIC_URL='/static/'; STATIC_ROOT=os.path.join(BASE_DIR,'static')
+MEDIA_URL='/media/';  MEDIA_ROOT=os.path.join(BASE_DIR,'media')
+PRIVATE_STORAGE_ROOT=os.path.join(BASE_DIR,'private')
+DEFAULT_AUTO_FIELD='django.db.models.BigAutoField'
+SITE_ID=1
+AUTH_USER_MODEL='openwisp_users.User'
+ACCOUNT_EMAIL_VERIFICATION='none'
+ACCOUNT_AUTHENTICATION_METHOD='username'
+ACCOUNT_EMAIL_REQUIRED=False
 EOF
-
   cat > "${APP_DIR}/app/openwisp_proj/urls.py" <<'EOF'
 from django.contrib import admin
 from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
-
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('accounts/', include('allauth.urls')),
 ]
 urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
 EOF
-
-  MANAGE_PATH="${APP_DIR}/app/manage.py"
-  if [ ! -f "${MANAGE_PATH}" ]; then
-    cat > "${MANAGE_PATH}" <<'EOF'
-#!/usr/bin/env python3
-import os, sys
-if __name__ == "__main__":
-    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "openwisp_proj.settings")
-    from django.core.management import execute_from_command_line
-    execute_from_command_line(sys.argv)
-EOF
-    chmod +x "${MANAGE_PATH}"
-  fi
 fi
 
-DJANGO_DIR="$(dirname "${MANAGE_PATH}")"
-mkdir -p "${DJANGO_DIR}/static" "${DJANGO_DIR}/media" "${DJANGO_DIR}/private"
+# Patch existing settings: ensure required apps/fields
+mapfile -t SFILES < <(find "${APP_DIR}" -maxdepth 12 -type f -name settings.py -not -path "*/venv/*" -not -path "*/.git/*")
+for f in "${SFILES[@]}"; do
+python - "$f" <<'PY'
+import sys,re
+p=sys.argv[1]; s=open(p,'r',encoding='utf-8').read(); orig=s
+def ensure_line(content):
+    global s
+    if content not in s: s+="\n"+content+"\n"
+# basic fields
+ensure_line('DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"')
+ensure_line('SITE_ID = 1')
+ensure_line('PRIVATE_STORAGE_ROOT = os.path.join(BASE_DIR, "private")')
+# INSTALLED_APPS inject
+def inject_app(name):
+    global s
+    m=re.search(r'INSTALLED_APPS\s*=\s*\[', s)
+    if m and name not in s:
+        s=s[:m.end()]+"\n    '"+name+"',"+s[m.end():]
+for a in ["django.contrib.sites","rest_framework","rest_framework.authtoken","allauth","allauth.account","allauth.socialaccount","dj_rest_auth","private_storage","openwisp_users","openwisp_controller","openwisp_radius"]:
+    inject_app(a)
+# MIDDLEWARE: AccountMiddleware
+if "allauth.account.middleware.AccountMiddleware" not in s:
+    m=re.search(r'MIDDLEWARE\s*=\s*\[', s)
+    if m:
+        s=s[:m.end()]+"\n    'allauth.account.middleware.AccountMiddleware',"+s[m.end():]
+if s!=orig: open(p,'w',encoding='utf-8').write(s)
+print("patched:",p)
+PY
+done
+
+echo "[9/12] Migrate / collectstatic / superuser(idempotent)"
+DJANGO_DIR="$(dirname "${MANAGE_PATH:-$(find "${APP_DIR}" -maxdepth 12 -type f -name manage.py -not -path "*/venv/*" | head -n1)}")"
 source "${APP_DIR}/venv/bin/activate"
+mkdir -p "${DJANGO_DIR}/static" "${DJANGO_DIR}/media" "${DJANGO_DIR}/private"
 cd "${DJANGO_DIR}"
 python manage.py migrate --noinput
 python manage.py collectstatic --noinput
@@ -213,23 +244,22 @@ export DJANGO_SUPERUSER_USERNAME DJANGO_SUPERUSER_EMAIL DJANGO_SUPERUSER_PASSWOR
 python manage.py shell <<'PYCODE'
 from django.contrib.auth import get_user_model
 import os
-User = get_user_model()
-u, created = User.objects.get_or_create(
+User=get_user_model()
+u,created=User.objects.get_or_create(
     username=os.environ["DJANGO_SUPERUSER_USERNAME"],
-    defaults={"email": os.environ["DJANGO_SUPERUSER_EMAIL"], "is_staff": True, "is_superuser": True},
+    defaults={"email": os.environ["DJANGO_SUPERUSER_EMAIL"], "is_staff": True, "is_superuser": True}
 )
 if created:
     u.set_password(os.environ["DJANGO_SUPERUSER_PASSWORD"]); u.save()
 PYCODE
 
+echo "[10/12] Apache vhost + SSL"
+# WSGI auto-detect
 if [ -z "${WSGI_PATH}" ]; then
   WSGI_PATH="$(find "${APP_DIR}" -maxdepth 12 -type f -name wsgi.py -not -path '*/venv/*' -not -path '*/.git/*' | head -n1 || true)"
 fi
-[ -n "${WSGI_PATH}" ] && [ -f "${WSGI_PATH}" ] || { echo "ERROR: wsgi.py not found"; exit 1; }
-STATIC_DIR="${DJANGO_DIR}/static"
-MEDIA_DIR="${DJANGO_DIR}/media"
-VHOST_FILE="/etc/apache2/sites-available/${DOMAIN}.conf"
-sudo tee "${VHOST_FILE}" >/dev/null <<APACHECONF
+STATIC_DIR="${DJANGO_DIR}/static"; MEDIA_DIR="${DJANGO_DIR}/media"; VHOST="/etc/apache2/sites-available/${DOMAIN}.conf"
+sudo tee "${VHOST}" >/dev/null <<APACHECONF
 <VirtualHost *:80>
     ServerName ${DOMAIN}
     ServerAlias www.${DOMAIN}
@@ -249,11 +279,11 @@ sudo a2ensite "${DOMAIN}.conf"
 sudo a2dissite 000-default.conf default-ssl.conf 2>/dev/null || true
 sudo apachectl configtest
 sudo systemctl restart apache2
-
 DOMS=(-d "${DOMAIN}")
 if getent hosts "www.${DOMAIN}" >/dev/null 2>&1; then DOMS+=(-d "www.${DOMAIN}"); fi
 sudo certbot --apache "${DOMS[@]}" --non-interactive --agree-tos -m "${EMAIL}" --redirect || true
 
+echo "[11/12] WireGuard + OpenVPN + NAT"
 WAN_IF="$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
 sudo install -d -m 0700 /etc/wireguard
 [ -f /etc/wireguard/server_private.key ] || (umask 077; wg genkey | sudo tee /etc/wireguard/server_private.key >/dev/null)
@@ -296,19 +326,16 @@ client-to-client
 keepalive 10 120
 persist-key
 persist-tun
-
 cipher AES-256-GCM
 data-ciphers AES-256-GCM:AES-128-GCM
 data-ciphers-fallback AES-256-GCM
 auth SHA256
-
 ca /etc/openvpn/ca.crt
 cert /etc/openvpn/ovpn-main.crt
 key /etc/openvpn/ovpn-main.key
 dh /etc/openvpn/dh.pem
 tls-auth /etc/openvpn/ta.key 0
 key-direction 0
-
 user nobody
 group nogroup
 status /var/log/openvpn-status.log
@@ -317,8 +344,8 @@ verb 3
 EOF
 sudo systemctl enable --now openvpn@server
 
+echo "[12/12] Persist NAT + health"
 sudo netfilter-persistent save || true
-
 echo "== Ports =="; sudo ss -lunp | grep -E ':(1194|51820|80|443)' || true
 echo "== WireGuard =="; sudo wg show || true
 echo "== OpenVPN =="; sudo systemctl status openvpn@server --no-pager || true
