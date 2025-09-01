@@ -6,10 +6,10 @@ export DEBIAN_FRONTEND=noninteractive
 APP_DIR="${APP_DIR:-/opt/openwisp2}"
 REPO_URL="${REPO_URL:-https://github.com/sarmadaf24/BabyBlue.git}"
 BRANCH="${BRANCH:-main}"
-OLD_DOMAIN="${OLD_DOMAIN:-baby.bluenet.click}"   # دامنه‌ای که باید جایگزین شود
-SECRETS_URL="${SECRETS_URL:-}"                   # اختیاری: tar.gz شامل db/media/keys
+OLD_DOMAIN="${OLD_DOMAIN:-baby.bluenet.click}"
+SECRETS_URL="${SECRETS_URL:-}"
 
-# اگر DOMAIN ست نیست، از کاربر بپرس
+# Prompt domain if not provided
 if [ -z "${DOMAIN:-}" ]; then
   read -rp "Enter NEW domain (e.g. example.com): " DOMAIN
 fi
@@ -18,12 +18,15 @@ if [ -z "${DOMAIN}" ]; then
 fi
 EMAIL="${EMAIL:-admin@${DOMAIN}}"
 
-# Django superuser
+# (Optional) override paths if repo ساختار خاص دارد
+MANAGE_PATH="${MANAGE_PATH:-}"   # مثال: /opt/openwisp2/src/manage.py
+WSGI_PATH="${WSGI_PATH:-}"       # مثال: /opt/openwisp2/config/wsgi.py
+
 DJANGO_SUPERUSER_USERNAME="${DJANGO_SUPERUSER_USERNAME:-admin}"
 DJANGO_SUPERUSER_EMAIL="${DJANGO_SUPERUSER_EMAIL:-${EMAIL}}"
 DJANGO_SUPERUSER_PASSWORD="${DJANGO_SUPERUSER_PASSWORD:-ChangeMe!123}"
 
-echo "[0/10] Preseed (no prompts: iptables-persistent, postfix)"
+echo "[0/10] Preseed (no prompts)"
 sudo bash -lc "
   echo 'iptables-persistent iptables-persistent/autosave_v4 boolean false' | debconf-set-selections
   echo 'iptables-persistent iptables-persistent/autosave_v6 boolean false' | debconf-set-selections
@@ -57,7 +60,6 @@ echo "[3/10] Release :80 for Apache"
 sudo systemctl stop nginx || true
 sudo systemctl disable nginx || true
 sudo systemctl mask nginx || true
-# کشتن هر پروسه روی پورت 80
 sudo bash -lc "ss -ltnp | awk '\$4 ~ /:80$/' | awk '{print \$NF}' | sed 's/pid=//;s/,.*//' | xargs -r kill -9" || true
 sudo a2enmod wsgi headers rewrite
 sudo systemctl enable --now apache2
@@ -91,24 +93,32 @@ if [ -n "${SECRETS_URL}" ]; then
   rm -f "${TMP_SECRETS}"
 fi
 
-echo "[7/10] Domain replace inside project (replace ${OLD_DOMAIN} → ${DOMAIN})"
-# فقط فایل‌های متنی معمول
-find "${APP_DIR}" -type f \( \
-  -name "*.py" -o -name "*.conf" -o -name "*.env" -o -name "*.json" -o \
-  -name "*.yml" -o -name "*.yaml" -o -name "*.ini" -o -name "*.txt" -o \
-  -name "*.html" -o -name "*.htm" -o -name "*.css" -o -name "*.js" -o \
-  -name "*.service" \
-\) -print0 | xargs -0 -r sed -i \
-  -e "s/${OLD_DOMAIN//\./\\.}/${DOMAIN//\./\\.}/g" \
-  -e "s/www\.${OLD_DOMAIN//\./\\.}/www.${DOMAIN//\./\\.}/g"
+echo "[7/10] Domain replace in project (only if different)"
+if [ "${DOMAIN}" != "${OLD_DOMAIN}" ]; then
+  find "${APP_DIR}" -type f \( \
+    -name "*.py" -o -name "*.conf" -o -name "*.env" -o -name "*.json" -o \
+    -name "*.yml" -o -name "*.yaml" -o -name "*.ini" -o -name "*.txt" -o \
+    -name "*.html" -o -name "*.htm" -o -name "*.css" -o -name "*.js" -o \
+    -name "*.service" \
+  \) -not -path "*/venv/*" -not -path "*/.git/*" -print0 | xargs -0 -r sed -i \
+    -e "s/${OLD_DOMAIN//\./\\.}/${DOMAIN//\./\\.}/g" \
+    -e "s/www\.${OLD_DOMAIN//\./\\.}/www.${DOMAIN//\./\\.}/g"
+else
+  echo "Skip replace: DOMAIN equals OLD_DOMAIN (${DOMAIN})"
+fi
 
-echo "[8/10] Django migrate/collectstatic + superuser"
-# پیدا کردن manage.py
-MANAGE_FILE="$(find "${APP_DIR}" -maxdepth 4 -type f -name manage.py | head -n1 || true)"
-if [ -z "${MANAGE_FILE}" ]; then
+echo "[8/10] Detect manage.py / migrate / collectstatic / superuser"
+if [ -z "${MANAGE_PATH}" ]; then
+  MANAGE_PATH="$(find "${APP_DIR}" -maxdepth 8 -type f -name manage.py \
+    -not -path '*/venv/*' -not -path '*/.git/*' | head -n1 || true)"
+fi
+if [ -z "${MANAGE_PATH}" ] || [ ! -f "${MANAGE_PATH}" ]; then
   echo "ERROR: manage.py not found under ${APP_DIR}"; exit 1
 fi
-DJANGO_DIR="$(dirname "${MANAGE_FILE}")"
+DJANGO_DIR="$(dirname "${MANAGE_PATH}")"
+echo "MANAGE_PATH=${MANAGE_PATH}"
+echo "DJANGO_DIR=${DJANGO_DIR}"
+
 source "${APP_DIR}/venv/bin/activate"
 cd "${DJANGO_DIR}"
 python manage.py migrate --noinput
@@ -126,11 +136,13 @@ if created:
     u.set_password(os.environ["DJANGO_SUPERUSER_PASSWORD"]); u.save()
 PYCODE
 
-echo "[9/10] Apache vhost + WSGI (auto-detect)"
-# پیدا کردن wsgi.py
-WSGI_FILE="${APP_DIR}/config/wsgi.py"
-[ -f "${WSGI_FILE}" ] || WSGI_FILE="$(find "${APP_DIR}" -maxdepth 4 -type f -name wsgi.py | head -n1 || true)"
-if [ -z "${WSGI_FILE}" ]; then
+echo "[9/10] Apache vhost + WSGI (auto-detect or override)"
+if [ -z "${WSGI_PATH}" ]; then
+  WSGI_PATH="${APP_DIR}/config/wsgi.py"
+  [ -f "${WSGI_PATH}" ] || WSGI_PATH="$(find "${APP_DIR}" -maxdepth 8 -type f -name wsgi.py \
+    -not -path '*/venv/*' -not -path '*/.git/*' | head -n1 || true)"
+fi
+if [ -z "${WSGI_PATH}" ] || [ ! -f "${WSGI_PATH}" ]; then
   echo "ERROR: wsgi.py not found under ${APP_DIR}"; exit 1
 fi
 STATIC_DIR="${DJANGO_DIR}/static"
@@ -143,7 +155,7 @@ sudo tee "/etc/apache2/sites-available/${DOMAIN}.conf" >/dev/null <<APACHECONF
 
     WSGIDaemonProcess babyblue python-home=${APP_DIR}/venv python-path=${APP_DIR}
     WSGIProcessGroup babyblue
-    WSGIScriptAlias / ${WSGI_FILE}
+    WSGIScriptAlias / ${WSGI_PATH}
 
     Alias /static ${STATIC_DIR}
     <Directory ${STATIC_DIR}>
@@ -155,7 +167,7 @@ sudo tee "/etc/apache2/sites-available/${DOMAIN}.conf" >/dev/null <<APACHECONF
         Require all granted
     </Directory>
 
-    <Directory "$(dirname "${WSGI_FILE}")">
+    <Directory "$(dirname "${WSGI_PATH}")">
         <Files wsgi.py>
             Require all granted
         </Files>
@@ -165,6 +177,7 @@ sudo tee "/etc/apache2/sites-available/${DOMAIN}.conf" >/dev/null <<APACHECONF
     CustomLog \${APACHE_LOG_DIR}/${DOMAIN}_access.log combined
 </VirtualHost>
 APACHECONF
+
 sudo a2ensite "${DOMAIN}.conf"
 sudo a2dissite 000-default.conf || true
 sudo apachectl configtest
