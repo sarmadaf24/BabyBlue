@@ -18,6 +18,7 @@ apt-get install -y git curl rsync openssh-client ca-certificates \
   build-essential python3-dev pkg-config libpcre3-dev libssl-dev zlib1g-dev libffi-dev libpq-dev \
   gdal-bin libgdal-dev libgeos-dev libspatialite-dev libsqlite3-mod-spatialite \
   libcairo2 libpango-1.0-0 libpangocairo-1.0-0 gnupg lsb-release >/dev/null || true
+systemctl enable --now redis-server postgresql >/dev/null 2>&1 || true
 
 # InfluxDB 1.x (best-effort)
 if ! dpkg -s influxdb >/dev/null 2>&1; then
@@ -27,7 +28,7 @@ if ! dpkg -s influxdb >/dev/null 2>&1; then
   apt-get update -y >/dev/null || true
   apt-get install -y influxdb || true
 fi
-systemctl enable --now influxdb redis-server postgresql >/dev/null 2>&1 || true
+systemctl enable --now influxdb >/dev/null 2>&1 || true
 
 # Apache HTTP (ACME)
 a2enmod ssl proxy proxy_http headers rewrite >/dev/null 2>&1 || true
@@ -45,7 +46,7 @@ a2ensite openwisp.conf >/dev/null 2>&1 || true
 a2dissite openwisp-ssl.conf >/dev/null 2>&1 || true
 apache2ctl configtest >/dev/null && systemctl reload apache2 || systemctl restart apache2 || true
 
-# Certbot (standalone fallback)
+# Certbot standalone fallback
 if [ ! -s "/etc/letsencrypt/live/${BB_DOMAIN}/fullchain.pem" ]; then
   systemctl stop apache2 || true
   certbot certonly --standalone -d "${BB_DOMAIN}" --non-interactive --agree-tos -m "${BB_EMAIL}" || true
@@ -90,7 +91,114 @@ for u in gunicorn.service celery.service celery@worker.service celery-beat.servi
 done
 systemctl daemon-reload || true
 
-# Apache vhosts from source → retarget domain/cert
+# Apache vhosts from source → retarget domain/certs
 TMP_ETC="/tmp/src_web_$$"; mkdir -p "${TMP_ETC}"
 rsync -a -e "ssh -p ${SSH_PORT}" "${SRC}:/etc/apache2/sites-available/" "${TMP_ETC}/" 2>/dev/null || true
-SRC_DOM=$(ssh -p "${SSH_PORT}" "${SRC}" "grep -RhoE ServerName[[:space:]]+[^[:space:]]+ /etc/apache2/sites-available/*.conf 2>/dev/null | head -n1 | awk {print
+SRC_DOM=$(ssh -p "${SSH_PORT}" "${SRC}" "grep -RhoE 'ServerName[[:space:]]+[^[:space:]]+' /etc/apache2/sites-available/*.conf 2>/dev/null | head -n1 | awk '{print \$2}' || true")
+[ -z "${SRC_DOM}" ] && SRC_DOM="${BB_DOMAIN}"
+if compgen -G "${TMP_ETC}/*.conf" >/dev/null; then
+  cp -a "${TMP_ETC}/"*".conf" /etc/apache2/sites-available/
+  perl -pi -e "s/\Q${SRC_DOM}\E/${BB_DOMAIN}/g" /etc/apache2/sites-available/*.conf || true
+  perl -pi -e "s#/etc/letsencrypt/live/.*/fullchain.pem#/etc/letsencrypt/live/${BB_DOMAIN}/fullchain.pem#g" /etc/apache2/sites-available/*.conf || true
+  perl -pi -e "s#/etc/letsencrypt/live/.*/privkey.pem#/etc/letsencrypt/live/${BB_DOMAIN}/privkey.pem#g" /etc/apache2/sites-available/*.conf || true
+fi
+
+# DB dump/restore
+mkdir -p /root/dbsync
+ssh -p "${SSH_PORT}" "${SRC}" "sudo -u postgres pg_dump -Fc openwisp" > /root/dbsync/openwisp.dump || true
+if [ -s /root/dbsync/openwisp.dump ]; then
+  sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='openwisp';" | grep -q 1 || sudo -u postgres createdb openwisp
+  sudo -u postgres pg_restore -j 2 -c -d openwisp /root/dbsync/openwisp.dump || true
+fi
+
+# RADIUS / VPN / UFW
+rsync -a -e "ssh -p ${SSH_PORT}" "${SRC}:/etc/freeradius/3.0/" "/etc/freeradius/3.0/" 2>/dev/null || true
+systemctl enable --now freeradius >/dev/null 2>&1 || systemctl enable --now freeradius.service >/dev/null 2>&1 || true
+rsync -a -e "ssh -p ${SSH_PORT}" "${SRC}:/etc/openvpn/" "/etc/openvpn/" 2>/dev/null || true
+systemctl enable --now openvpn >/dev/null 2>&1 || systemctl enable --now openvpn-server@server >/dev/null 2>&1 || true
+rsync -a -e "ssh -p ${SSH_PORT}" "${SRC}:/etc/wireguard/" "/etc/wireguard/" 2>/dev/null || true
+systemctl enable --now wg-quick@wg0 >/dev/null 2>&1 || true
+ufw --force enable || true
+for p in 22/tcp 80/tcp 443/tcp; do ufw allow "$p" || true; done
+ufw allow 1194/udp || true
+ufw allow 51820/udp || true
+
+# Python venv + reqs (fallback without uWSGI on failure)
+if [ ! -x "${APP}/venv/bin/python" ]; then
+  python3 -m venv "${APP}/venv"
+fi
+. "${APP}/venv/bin/activate" || true
+pip install --upgrade pip >/dev/null || true
+if [ -f "${APP}/requirements.txt" ]; then
+  if ! pip install -r "${APP}/requirements.txt"; then
+    echo "uWSGI build failed; retrying without uWSGI..."
+    awk 'BEGIN{IGNORECASE=1} !/^[[:space:]]*uwsgi([[:space:]=><]|$)/' "${APP}/requirements.txt" > /tmp/req_no_uwsgi.txt || true
+    pip install -r /tmp/req_no_uwsgi.txt
+  fi
+else
+  pip install openwisp-controller openwisp-ipam openwisp-monitoring openwisp-users netjsonconfig django psycopg2-binary gunicorn
+fi
+
+# Django ops
+if [ -f "${APP}/manage.py" ]; then
+  "${APP}/venv/bin/python" "${APP}/manage.py" migrate --noinput || true
+  DJANGO_SUPERUSER_USERNAME="${BB_SU}" DJANGO_SUPERUSER_EMAIL="${BB_EMAIL}" DJANGO_SUPERUSER_PASSWORD="${BB_SP}" "${APP}/venv/bin/python" "${APP}/manage.py" createsuperuser --noinput || true
+  "${APP}/venv/bin/python" "${APP}/manage.py" collectstatic --noinput || true
+fi
+
+# Gunicorn
+cat >/etc/systemd/system/gunicorn.service <<UNIT
+[Unit]
+Description=Gunicorn for OpenWISP
+After=network.target
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=${APP}
+Environment=PATH=${APP}/venv/bin
+ExecStart=${APP}/venv/bin/gunicorn --workers 3 --bind 127.0.0.1:8001 openwisp2.wsgi:application
+Restart=always
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now gunicorn
+
+# Apache SSL vhost
+cat >/etc/apache2/sites-available/openwisp-ssl.conf <<SSLV
+<VirtualHost *:443>
+    ServerName ${BB_DOMAIN}
+    SSLEngine on
+    SSLCertificateFile /etc/letsencrypt/live/${BB_DOMAIN}/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/${BB_DOMAIN}/privkey.pem
+    ProxyPreserveHost On
+    RequestHeader set X-Forwarded-Proto https
+    ProxyPass / http://127.0.0.1:8001/
+    ProxyPassReverse / http://127.0.0.1:8001/
+    ErrorLog \${APACHE_LOG_DIR}/openwisp_error.log
+    CustomLog \${APACHE_LOG_DIR}/openwisp_access.log combined
+</VirtualHost>
+SSLV
+a2ensite openwisp-ssl.conf >/dev/null 2>&1 || true
+apache2ctl configtest >/dev/null && systemctl reload apache2 || systemctl restart apache2
+
+# Healthchecks
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://${BB_DOMAIN}")
+HTTPS_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" "https://${BB_DOMAIN}")
+ADMIN_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" "https://${BB_DOMAIN}/admin/login/")
+GUNI_STATUS=inactive; systemctl is-active gunicorn >/dev/null 2>&1 && GUNI_STATUS=active
+RAD_STATUS=inactive; systemctl is-active freeradius >/dev/null 2>&1 && RAD_STATUS=active
+OVPN_STATUS=inactive; systemctl is-active openvpn >/dev/null 2>&1 && OVPN_STATUS=active; systemctl is-active openvpn-server@server >/dev/null 2>&1 && OVPN_STATUS=active
+WG_STATUS=inactive; systemctl is-active wg-quick@wg0 >/dev/null 2>&1 && WG_STATUS=active
+
+echo "HTTP_STATUS=${HTTP_CODE}"
+echo "HTTPS_STATUS=${HTTPS_CODE}"
+echo "ADMIN_STATUS=${ADMIN_CODE}"
+echo "GUNICORN=${GUNI_STATUS}"
+echo "RADIUS=${RAD_STATUS}"
+echo "OPENVPN=${OVPN_STATUS}"
+echo "WIREGUARD=${WG_STATUS}"
+echo "Admin: https://${BB_DOMAIN}/admin/"
+[ -f /root/babyblue_inventory/openwisp_env.sh ] && echo "API base: https://${BB_DOMAIN}/api/v1/ (Bearer token in /root/babyblue_inventory/openwisp_env.sh)" || true
+printf "\033[1;32m%s\033[0m\n" "BlueHub net.isp.vpn"
+printf "\033[1;32m%s\033[0m\n" "Done Join & Enjoy"
