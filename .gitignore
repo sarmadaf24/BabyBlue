@@ -1,3 +1,4 @@
-
-# ignore local patches
-*.patch
+# BabyBlue GitOps source snapshot
+.DS_Store
+state/files/media/*
+state/files/static/*

@@ -1,0 +1,13 @@
+# /etc/systemd/system/openwisp-celery.service
+[Unit]
+Description=OpenWISP Celery Worker
+After=network.target redis-server.service
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/openwisp2
+Environment="DJANGO_SETTINGS_MODULE=openwisp2.settings"
+ExecStart=/opt/openwisp2/env/bin/celery -A openwisp2 worker -l INFO --concurrency=2
+Restart=always
+[Install]
+WantedBy=multi-user.target

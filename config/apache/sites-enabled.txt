@@ -1,0 +1,3 @@
+total 0
+lrwxrwxrwx 1 root root 32 Sep  1 23:59 openwisp.conf -> ../sites-available/openwisp.conf
+lrwxrwxrwx 1 root root 36 Sep  2 00:47 openwisp-ssl.conf -> ../sites-available/openwisp-ssl.conf
